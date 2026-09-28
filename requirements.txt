@@ -1,0 +1,5 @@
+streamlit
+pillow
+google-genai>=1.0
+reportlab>=4.0
+requests>=2.32

@@ -1,0 +1,13 @@
+# venv 폴더는 용량이 크고 내 컴퓨터 전용이라 GitHub에 올리지 않는다
+venv/
+
+# 파이썬이 자동 생성하는 캐시 파일
+__pycache__/
+*.pyc
+
+# API 키 같은 비밀 정보 (절대 GitHub에 올리면 안 됨)
+.env
+.streamlit/secrets.toml
+
+# macOS가 자동 생성하는 파일
+.DS_Store
