@@ -14,8 +14,10 @@ from checker import SPECS, check_image
 from diagnosis import diagnose_detailed, render_diagnosis_markdown
 from criteria import DEFAULT_CRITERIA, PLATFORM_PRESETS, build_selected_criteria
 from market_analysis import (
+    MARKET_SCHEMA,
     build_market_analysis_prompt,
     build_market_context_for_diagnosis,
+    download_market_reference_images,
     normalize_market_analysis,
 )
 from ogq_market import OGQAPIError, search_by_keywords
@@ -179,79 +181,91 @@ def _keywords_from_user_input(feelings: str, user_tags: list[str], limit: int = 
 def _generate_market_ai(
     gemini_key: str,
     market_prompt: str,
+    user_image_bytes: bytes,
+    user_image_mime: str,
+    market_results: list[dict],
     *,
-    max_output_tokens: int = 1400,
+    max_output_tokens: int = 1700,
 ) -> tuple[dict, str | None]:
-    """시장 비교 AI를 구조화된 JSON으로 호출한다.
-
-    구조화된 출력(response_schema)을 사용해 Markdown/JSON 파싱 실패를 줄인다.
-    일시적인 5xx/ServerError가 발생하면 모델 fallback을 시도한다.
-    """
+    """사용자 실제 이미지와 OGQ 참조 이미지를 함께 비교 분석한다."""
     from google import genai
     from google.genai import types
     from google.genai.errors import APIError, ServerError
+    import json
+    import random
+    import time
 
     client = genai.Client(api_key=gemini_key)
-    models = ["gemini-3.8-flash", "gemini-3.6-flash"]
+    models = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
+    refs = download_market_reference_images(market_results[:4])
+
+    visual_instruction = """
+[이미지 비교 규칙]
+- 첫 번째 첨부 이미지는 '사용자 스티커'입니다.
+- 이후 첨부 이미지는 각각 'OGQ 검색 결과 [번호]'의 실제 이미지입니다.
+- 사용자가 입력한 태그는 보조 정보일 뿐이며, 이미지 자체보다 우선하지 않습니다.
+- 사용자의 태그만 보고 시장과의 차이를 만들어내지 마세요.
+- 사용자 이미지와 시장 참조 이미지가 실제로 같은 스티커이거나 거의 동일하면 그 사실을 명확하게 인정하고 유사성을 매우 높음으로 평가하세요.
+- 검색 결과의 제목/태그가 서로 달라도 실제 이미지가 같다면 '다르다'고 쓰지 마세요.
+- differences는 실제 이미지 또는 제목/설명/태그 중 확인 가능한 근거가 있을 때만 작성하세요.
+- comparisons는 실제로 비교 가능한 결과만 최대 4개 작성하세요.
+"""
+    contents = [
+        market_prompt + "\n" + visual_instruction,
+        "[USER STICKER IMAGE]",
+        types.Part.from_bytes(data=user_image_bytes, mime_type=user_image_mime),
+    ]
+    for ref in refs:
+        contents.extend([
+            f"[OGQ SEARCH RESULT {ref['index']}] {ref['title']}",
+            types.Part.from_bytes(data=ref["bytes"], mime_type=ref["mime_type"]),
+        ])
+
     last_error: Exception | None = None
-
     for model_name in models:
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=market_prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=MARKET_SCHEMA,
-                    max_output_tokens=max_output_tokens,
-                    temperature=0.2,
-                ),
-            )
-            raw = (response.text or "").strip()
-            if not raw:
-                return {}, f"{model_name}이 빈 응답을 반환했습니다."
-
+        for attempt in range(2):
             try:
-                import json
-                parsed = json.loads(raw)
-            except json.JSONDecodeError:
-                # 구조화 출력이 깨진 경우 마지막 안전망으로 첫 JSON 객체를 찾는다.
-                import json
-                start = raw.find("{")
-                end = raw.rfind("}")
-                if start >= 0 and end > start:
-                    try:
-                        parsed = json.loads(raw[start : end + 1])
-                    except json.JSONDecodeError as exc:
-                        return {}, f"시장 분석 JSON을 읽지 못했습니다: {exc}"
-                else:
-                    return {}, "시장 분석 결과가 올바른 JSON 형식이 아닙니다."
-
-            return normalize_market_analysis(parsed), None
-
-        except ServerError as exc:
-            last_error = exc
-            continue
-        except APIError as exc:
-            last_error = exc
-            code = getattr(exc, "code", None)
-            if isinstance(code, int) and 500 <= code < 600:
-                continue
-            return {}, f"Gemini API 오류({code or '알 수 없음'}): {str(exc)}"
-        except Exception as exc:
-            last_error = exc
-            continue
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=MARKET_SCHEMA,
+                        max_output_tokens=max_output_tokens,
+                        temperature=0.15,
+                    ),
+                )
+                raw = (response.text or "").strip()
+                if not raw:
+                    raise RuntimeError(f"{model_name}이 빈 응답을 반환했습니다.")
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError:
+                    start_json = raw.find("{")
+                    end_json = raw.rfind("}")
+                    if start_json < 0 or end_json <= start_json:
+                        raise RuntimeError("시장 분석 결과가 JSON으로 반환되지 않았습니다.")
+                    parsed = json.loads(raw[start_json:end_json + 1])
+                return normalize_market_analysis(parsed), None
+            except (ServerError, APIError, RuntimeError, json.JSONDecodeError) as exc:
+                last_error = exc
+                code = getattr(exc, "code", None)
+                transient = isinstance(exc, ServerError) or code in {408, 429, 500, 502, 503, 504}
+                if transient and attempt < 1:
+                    time.sleep(min(6.0, 1.5 * (2 ** attempt)) + random.uniform(0, 0.4))
+                    continue
+                if not transient:
+                    break
 
     return {}, (
-        "Gemini 시장 비교 분석에 실패했습니다. "
-        "검색된 OGQ 콘텐츠는 정상적으로 확인할 수 있습니다. "
+        "Gemini 시장 비교 분석에 실패했습니다. 검색된 OGQ 콘텐츠는 정상적으로 확인할 수 있습니다. "
         f"({last_error})"
     )
 
 
 # ---------- 0단계: 검사 기준 ----------
 st.header("검사 기준 설정")
-st.caption("OGQ 공개 가이드를 기본으로 불러오고, 원하는 검사 항목만 선택하거나 나만의 기준을 추가할 수 있어요.")
+st.caption("OGQ 공개 가이드를 기본으로 불러오고, 원하는 검사 항목만 선택하거나 나만의 기준을 원하는 만큼 추가할 수 있어요.")
 
 preset_names = list(PLATFORM_PRESETS.keys()) + ["내가 직접 선택"]
 preset = st.selectbox("검사 기준 프로필", preset_names, index=0)
@@ -268,20 +282,51 @@ selected_criteria = st.multiselect(
     default=selected_default,
 )
 
+if "custom_rules" not in st.session_state:
+    st.session_state["custom_rules"] = []
+
+st.markdown("**나만의 검사 기준**")
 custom_rule_text = st.text_input(
-    "나만의 검사 기준 추가 (선택)",
+    "새 검사 기준",
+    key="custom_rule_input",
     placeholder="예: 캐릭터 얼굴이 이미지의 30% 이상 보이는지 확인",
 )
-custom_rules = [custom_rule_text] if custom_rule_text.strip() else []
-selected_criteria = build_selected_criteria(
-    "내가 직접 선택",
-    selected_criteria,
-    custom_rules,
-)
+if st.button("＋ 검사 기준 추가"):
+    rule = " ".join(custom_rule_text.strip().split())
+    if not rule:
+        st.warning("추가할 검사 기준을 입력해주세요.")
+    elif rule in st.session_state["custom_rules"]:
+        st.info("이미 추가된 검사 기준입니다.")
+    else:
+        st.session_state["custom_rules"].append(rule)
+        st.success("검사 기준이 추가됐습니다. 다음 AI 진단에 적용됩니다.")
 
-with st.expander("현재 선택한 검사 기준 보기"):
-    for criterion in selected_criteria:
-        st.write(f"✓ {criterion}")
+custom_rules = list(st.session_state["custom_rules"])
+if custom_rules:
+    for idx, rule in enumerate(custom_rules):
+        c1, c2 = st.columns([8, 1])
+        with c1:
+            st.write(f"**{idx + 1}.** {rule}")
+        with c2:
+            if st.button("삭제", key=f"delete_custom_rule_{idx}"):
+                st.session_state["custom_rules"].pop(idx)
+                st.rerun()
+else:
+    st.caption("아직 사용자 지정 기준이 없습니다. 원하는 만큼 추가할 수 있습니다.")
+
+selected_criteria = build_selected_criteria("내가 직접 선택", selected_criteria, custom_rules)
+standard_selected = [item for item in selected_criteria if item not in custom_rules]
+with st.expander("이번 AI 진단에 적용되는 기준 확인", expanded=True):
+    st.success(f"적용됨 · 기본/공개 기준 {len(standard_selected)}개 + 나만의 기준 {len(custom_rules)}개")
+    if standard_selected:
+        st.markdown("**기본/공개 기준**")
+        for criterion in standard_selected:
+            st.write(f"✓ {criterion}")
+    if custom_rules:
+        st.markdown("**나만의 기준 — 개별 결과가 별도 표시됩니다**")
+        for rule in custom_rules:
+            st.write(f"✓ {rule}")
+
 st.caption("파일 해상도·용량·형식 같은 기술 규격 검사는 기본으로 유지되고, 위에서 선택한 영역은 AI 심층 진단에 적용됩니다.")
 
 # ---------- 1단계: 이미지 + 사용자 설명 ----------
@@ -392,11 +437,14 @@ if files:
 
                         gemini_key = _get_secret("GEMINI_API_KEY")
                         if gemini_key:
-                            with st.spinner("OGQ 시장 결과를 AI가 비교 분석하고 있어요..."):
+                            with st.spinner("OGQ 시장 결과를 실제 이미지와 비교 분석하고 있어요..."):
                                 analysis, error_message = _generate_market_ai(
                                     gemini_key,
                                     market_prompt,
-                                    max_output_tokens=1500,
+                                    all_file_results[0]["bytes"],
+                                    all_file_results[0]["mime"],
+                                    market_results[:8],
+                                    max_output_tokens=1700,
                                 )
                             if analysis:
                                 st.session_state["market_analysis"] = analysis
@@ -447,23 +495,42 @@ if files:
             if market_analysis.get("similarity_summary"):
                 st.write(market_analysis["similarity_summary"])
 
+            comparisons = market_analysis.get("comparisons") or []
+            if comparisons:
+                st.markdown("**시장 콘텐츠별 유사성**")
+                for comp in comparisons:
+                    try:
+                        idx = int(comp.get("result_index", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if not (1 <= idx <= len(market_results[:8])):
+                        continue
+                    source = market_results[idx - 1]
+                    st.markdown(f"**[{idx}] {source.get('title', 'OGQ 콘텐츠')} — 유사성: {comp.get('similarity_level', '보통')}**")
+                    if comp.get("similarity_reason"):
+                        st.write(comp["similarity_reason"])
+                    if comp.get("same_points"):
+                        st.caption("같은 점: " + " · ".join(comp["same_points"]))
+                    if comp.get("different_points"):
+                        st.caption("다른 점: " + " · ".join(comp["different_points"]))
+
             c1, c2 = st.columns(2)
             with c1:
-                st.markdown("**비슷하게 나타나는 요소**")
+                st.markdown("**시장 전반의 공통 요소**")
                 similarities = market_analysis.get("similarities") or []
                 if similarities:
                     for item in similarities:
                         st.markdown(f"- {item}")
                 else:
-                    st.caption("검색 결과에서 뚜렷하게 겹치는 요소를 찾지 못했습니다.")
+                    st.caption("검색 결과에서 반복적으로 확인되는 공통 요소가 없습니다.")
             with c2:
-                st.markdown("**구별되는 요소**")
+                st.markdown("**시장과의 차이점**")
                 differences = market_analysis.get("differences") or []
                 if differences:
                     for item in differences:
                         st.markdown(f"- {item}")
                 else:
-                    st.caption("검색 데이터만으로 확인되는 뚜렷한 차별점을 찾지 못했습니다.")
+                    st.caption("검색 데이터만으로 확인되는 뚜렷한 차이점이 없습니다.")
 
             st.markdown("**시장과 비교했을 때의 장점**")
             for item in (market_analysis.get("strengths") or []):
@@ -534,15 +601,18 @@ if files:
                             gemini_key,
                             selected_criteria=selected_criteria,
                             market_context=market_context,
+                            custom_criteria=custom_rules,
                         )
                         st.session_state[cache_key] = detailed
                     except Exception as exc:
                         st.session_state[cache_key] = {
-                            "summary": f"진단 중 오류가 발생했어요: {exc}",
+                            "summary": "진단 중 일시적인 오류가 발생했어요.",
+                            "detail": "Gemini가 일시적으로 사용량이 몰려 응답하지 않았습니다. 자동 재시도와 대체 모델을 시도했으며, 다시 진단하면 정상적으로 처리될 수 있습니다.",
                             "findings": [],
                             "strengths": [],
                             "market_note": "",
-                            "raw_text": "",
+                            "custom_criteria_results": [],
+                            "raw_text": str(exc),
                         }
 
                 progress.progress(
@@ -573,6 +643,21 @@ if files:
             expanded=True,
         ):
             st.markdown(diagnosis_texts[file_result["name"]])
+
+            if custom_rules:
+                custom_results = diagnosis.get("custom_criteria_results") or []
+                st.subheader("나만의 검사 기준 결과")
+                returned = {str(item.get("criterion", "")).strip() for item in custom_results if isinstance(item, dict)}
+                st.success(f"사용자 지정 기준 {len(returned)}/{len(custom_rules)}개 개별 평가가 반환되었습니다.")
+                status_icon = {"양호": "🟢", "주의": "🟡", "개선 필요": "🔴", "판단 어려움": "⚪"}
+                for rule in custom_rules:
+                    item = next((x for x in custom_results if isinstance(x, dict) and str(x.get("criterion", "")).strip() == rule), None)
+                    if not item:
+                        item = {"status": "판단 어려움", "result": "개별 평가가 반환되지 않았습니다.", "evidence": "응답 누락"}
+                    st.markdown(f"**{status_icon.get(item.get('status'), '⚪')} {rule} · {item.get('status', '판단 어려움')}**")
+                    st.write(item.get("result", ""))
+                    if item.get("evidence"):
+                        st.caption(f"근거: {item['evidence']}")
 
             findings = diagnosis.get("findings", [])
             if findings:
