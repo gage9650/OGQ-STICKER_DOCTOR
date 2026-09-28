@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image, ImageDraw
 
 from checker import SPECS, check_image
@@ -19,6 +21,7 @@ from market_analysis import (
     build_market_context_for_diagnosis,
     download_market_reference_images,
     normalize_market_analysis,
+    generate_public_web_check,
 )
 from ogq_market import OGQAPIError, search_by_keywords
 from report_utils import (
@@ -108,7 +111,7 @@ st.markdown(
 
 
 def _draw_annotations(file_bytes: bytes, findings: list[dict]) -> Image.Image:
-    """AI가 반환한 0~1000 bbox를 실제 이미지 좌표로 변환해 빨간 타원으로 표시한다."""
+    """Gemini 공식 bbox 형식 [ymin, xmin, ymax, xmax]을 실제 이미지 좌표로 변환한다."""
     import io
 
     image = Image.open(io.BytesIO(file_bytes)).convert("RGBA")
@@ -120,25 +123,110 @@ def _draw_annotations(file_bytes: bytes, findings: list[dict]) -> Image.Image:
         if not isinstance(bbox, list) or len(bbox) != 4:
             continue
 
-        left, top, right, bottom = bbox
-        box = (
-            int(left / 1000 * width),
-            int(top / 1000 * height),
-            int(right / 1000 * width),
-            int(bottom / 1000 * height),
-        )
+        try:
+            ymin, xmin, ymax, xmax = [max(0, min(1000, float(v))) for v in bbox]
+        except (TypeError, ValueError):
+            continue
+        if xmax <= xmin or ymax <= ymin:
+            continue
+
+        # Gemini 공식 형식: [ymin, xmin, ymax, xmax]
+        left = int(xmin / 1000 * width)
+        top = int(ymin / 1000 * height)
+        right = int(xmax / 1000 * width)
+        bottom = int(ymax / 1000 * height)
+
+        if right <= left or bottom <= top:
+            continue
+
+        # 지나치게 큰 영역은 표시하지 않는다. (모델이 전체 화면을 잘못 지정한 경우)
+        area_ratio = ((right - left) * (bottom - top)) / max(1, width * height)
+        if area_ratio > 0.90:
+            continue
+
+        line_width = max(3, min(width, height) // 85)
         draw.ellipse(
-            box,
+            (left, top, right, bottom),
             outline="#D92D20",
-            width=max(3, min(width, height) // 80),
+            width=line_width,
+        )
+        badge_left = max(0, left)
+        badge_top = max(0, top - 28)
+        draw.rounded_rectangle(
+            (badge_left, badge_top, badge_left + 26, badge_top + 24),
+            radius=8,
+            fill="#D92D20",
         )
         draw.text(
-            (box[0] + 4, max(0, box[1] - 22)),
+            (badge_left + 8, badge_top + 4),
             str(idx),
-            fill="#D92D20",
+            fill="#FFFFFF",
         )
 
     return image
+
+
+def _speak_completion(message: str = "") -> None:
+    """진단 완료 시 브라우저에서 짧은 2음 벨소리(띠링)를 재생한다.
+
+    기존 음성 합성(TTS)은 사용하지 않는다. 브라우저의 자동재생 정책에 의해
+    소리가 차단될 경우를 대비해 수동 재생 버튼을 함께 제공한다.
+    """
+    components.html(
+        """
+        <div style="font-family:sans-serif; padding:2px 0;">
+          <button id="ding-btn" style="border:1px solid #BFEFE9;border-radius:999px;padding:7px 14px;background:#EEFBF9;color:#0B3B36;font-weight:600;cursor:pointer;">🔔 완료음 다시 듣기</button>
+        </div>
+        <script>
+        (() => {
+          let played = false;
+
+          function ding() {
+            try {
+              const AudioContext = window.AudioContext || window.webkitAudioContext;
+              if (!AudioContext) return;
+
+              const ctx = new AudioContext();
+              const now = ctx.currentTime;
+
+              const gain = ctx.createGain();
+              gain.gain.setValueAtTime(0.0001, now);
+              gain.gain.exponentialRampToValueAtTime(0.22, now + 0.015);
+              gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.42);
+              gain.connect(ctx.destination);
+
+              const osc1 = ctx.createOscillator();
+              osc1.type = 'sine';
+              osc1.frequency.setValueAtTime(880, now);
+              osc1.frequency.exponentialRampToValueAtTime(1320, now + 0.10);
+              osc1.connect(gain);
+
+              const osc2 = ctx.createOscillator();
+              osc2.type = 'sine';
+              osc2.frequency.setValueAtTime(1320, now + 0.12);
+              osc2.frequency.exponentialRampToValueAtTime(1760, now + 0.22);
+              osc2.connect(gain);
+
+              osc1.start(now);
+              osc1.stop(now + 0.11);
+              osc2.start(now + 0.12);
+              osc2.stop(now + 0.28);
+
+              setTimeout(() => { try { ctx.close(); } catch (_) {} }, 650);
+              played = true;
+            } catch (_) {
+              // 브라우저 자동재생/AudioContext 제한 시 수동 버튼으로 재생 가능
+            }
+          }
+
+          const btn = document.getElementById('ding-btn');
+          btn?.addEventListener('click', ding);
+          setTimeout(() => { if (!played) ding(); }, 100);
+        })();
+        </script>
+        """,
+        height=45,
+    )
 
 
 def _get_secret(name: str, default: str = "") -> str:
@@ -261,6 +349,56 @@ def _generate_market_ai(
         "Gemini 시장 비교 분석에 실패했습니다. 검색된 OGQ 콘텐츠는 정상적으로 확인할 수 있습니다. "
         f"({last_error})"
     )
+
+
+def _run_ai_diagnostics(
+    all_file_results: list[dict],
+    selected_criteria: list[str],
+    custom_rules: list[str],
+    market_context: str,
+    gemini_key: str,
+) -> bool:
+    """전체 스티커 AI 진단을 실행한다. 성공/실패와 무관하게 UI가 계속 렌더링되도록 결과를 세션에 저장한다."""
+    progress = st.progress(0, text="AI가 스티커를 살펴보는 중...")
+    had_success = False
+    for i, file_result in enumerate(all_file_results):
+        digest = hashlib.sha256(file_result["bytes"]).hexdigest()[:16]
+        criteria_key = hashlib.md5(",".join(selected_criteria).encode("utf-8")).hexdigest()[:8]
+        market_key = hashlib.md5(market_context.encode("utf-8")).hexdigest()[:8]
+        cache_key = f"diag_v5_{file_result['name']}_{digest}_{criteria_key}_{market_key}"
+
+        if cache_key not in st.session_state:
+            try:
+                detailed = diagnose_detailed(
+                    file_result["bytes"],
+                    file_result["mime"],
+                    gemini_key,
+                    selected_criteria=selected_criteria,
+                    market_context=market_context,
+                    custom_criteria=custom_rules,
+                )
+                st.session_state[cache_key] = detailed
+                if detailed.get("model_used"):
+                    had_success = True
+            except Exception as exc:
+                st.session_state[cache_key] = {
+                    "summary": "이번 스티커의 AI 진단은 일시적으로 완료되지 않았습니다.",
+                    "detail": "Gemini 서버가 일시적으로 바쁘거나 요청을 처리하지 못했습니다. 자동 재시도와 대체 모델을 시도했지만 응답을 받지 못했습니다. 규격 검사 결과는 계속 확인할 수 있습니다.",
+                    "findings": [],
+                    "strengths": [],
+                    "market_note": "",
+                    "custom_criteria_results": [],
+                    "raw_text": "",
+                    "model_used": "",
+                    "diagnosis_error": str(exc),
+                }
+        else:
+            had_success = True
+
+        progress.progress((i + 1) / len(all_file_results), text=f"{i + 1}/{len(all_file_results)} 완료")
+
+    progress.empty()
+    return had_success
 
 
 # ---------- 0단계: 검사 기준 ----------
@@ -393,12 +531,22 @@ if files:
     st.header("3단계 · OGQ 시장 비교")
     st.caption("입력한 느낌과 태그를 키워드로 OGQ 마켓의 관련 스티커를 찾고, AI가 공통점·차이점·장단점을 분석합니다.")
 
+    auto_diagnose_after_market = st.checkbox(
+        "시장 비교가 끝나면 바로 AI 문제 표시까지 실행",
+        value=False,
+        key="auto_diagnose_after_market",
+        help="체크하면 시장 비교와 시장 분석이 끝난 직후 선택한 검사 기준으로 AI 진단을 자동 실행합니다.",
+    )
+
     if st.button("🔎 OGQ 시장과 비교하기", type="primary"):
         # 이전 결과를 먼저 비워서 검색 실패 시 오래된 결과가 보이지 않도록 한다.
         st.session_state.pop("market_results", None)
         st.session_state.pop("market_analysis", None)
         st.session_state.pop("market_context", None)
         st.session_state.pop("market_analysis_error", None)
+        st.session_state.pop("public_web_check", None)
+        st.session_state.pop("public_web_check_error", None)
+        st.session_state.pop("auto_diag_completed_for_market_key", None)
 
         ogq_api_key = _get_secret("OGQ_API_KEY")
         base_url = _get_secret(
@@ -426,6 +574,16 @@ if files:
                             user_id=None,
                         )
 
+                    # 업로드 이미지와 OGQ 검색 결과의 강한 시각 일치 신호를 먼저 계산
+                    from market_analysis import annotate_visual_match_hints
+                    market_results = annotate_visual_match_hints(
+                        all_file_results[0]["bytes"], market_results
+                    )
+                    # 강한 일치 신호가 있는 항목을 앞쪽으로 우선 배치
+                    market_results.sort(
+                        key=lambda item: float(item.get("visual_match_score") or 0.0),
+                        reverse=True,
+                    )
                     st.session_state["market_results"] = market_results
 
                     if market_results:
@@ -448,11 +606,23 @@ if files:
                                 )
                             if analysis:
                                 st.session_state["market_analysis"] = analysis
-                                # 이미지 진단에는 '분석을 위한 프롬프트'가 아니라
-                                # 실제 생성된 시장 분석 결과만 전달한다.
+
+                                # OGQ 데이터와 별개로, 공개 웹에서 대중적 유사성도 보조 조사한다.
+                                web_check = generate_public_web_check(
+                                    gemini_key,
+                                    feelings,
+                                    user_tags,
+                                )
+                                if web_check.get("text"):
+                                    st.session_state["public_web_check"] = web_check
+                                elif web_check.get("error"):
+                                    st.session_state["public_web_check_error"] = web_check["error"]
+
+                                # 이미지 진단에는 실제 시장 분석 + 공개 웹 보조 조사 결과를 전달한다.
                                 st.session_state["market_context"] = build_market_context_for_diagnosis(
                                     analysis,
                                     market_results[:8],
+                                    st.session_state.get("public_web_check", {}),
                                 )
                             if error_message:
                                 st.session_state["market_analysis_error"] = error_message
@@ -467,6 +637,24 @@ if files:
 
                 except OGQAPIError as exc:
                     st.error(f"OGQ 시장 검색에 실패했어요: {exc}")
+
+    # 시장 비교 완료 직후 자동 진단 옵션이 켜져 있으면 바로 AI 문제 표시까지 진행
+    if auto_diagnose_after_market and st.session_state.get("market_results") and st.session_state.get("market_context"):
+        if not st.session_state.get("auto_diag_completed_for_market_key"):
+            auto_key = hashlib.md5(st.session_state.get("market_context", "").encode("utf-8")).hexdigest()[:12]
+            gemini_key = _get_secret("GEMINI_API_KEY")
+            if gemini_key:
+                with st.spinner("시장 비교가 끝났어요. 바로 AI가 문제 위치를 분석하고 있어요..."):
+                    _run_ai_diagnostics(
+                        all_file_results,
+                        selected_criteria,
+                        custom_rules,
+                        st.session_state.get("market_context", ""),
+                        gemini_key,
+                    )
+                st.session_state["auto_diag_completed_for_market_key"] = auto_key
+                st.success("시장 비교에 이어 AI 문제 표시까지 완료했어요.")
+                _speak_completion("시장 비교와 AI 문제 진단이 모두 완료되었습니다.")
 
     market_results = st.session_state.get("market_results", [])
     if market_results:
@@ -567,6 +755,21 @@ if files:
             st.subheader("AI 시장 비교")
             st.markdown(str(st.session_state["market_analysis"]))
 
+        public_web = st.session_state.get("public_web_check")
+        if isinstance(public_web, dict) and public_web.get("text"):
+            st.markdown("**공개 웹 대중적 유사성 참고**")
+            st.caption("OGQ 마켓 밖의 공개 웹 자료를 보조적으로 확인한 결과입니다. 법적 표절·저작권 판단이 아닙니다.")
+            st.markdown(public_web["text"])
+            sources = public_web.get("sources") or []
+            if sources:
+                with st.expander("웹 검색 근거 보기"):
+                    for source in sources:
+                        title = source.get("title") or source.get("uri")
+                        uri = source.get("uri") or ""
+                        st.markdown(f"- [{title}]({uri})")
+        if st.session_state.get("public_web_check_error"):
+            st.caption(st.session_state["public_web_check_error"])
+
         if st.session_state.get("market_analysis_error"):
             st.warning(st.session_state["market_analysis_error"])
 
@@ -582,45 +785,19 @@ if files:
         if not gemini_key:
             st.error("Gemini API 키가 설정되지 않았어요. Streamlit Secrets에 GEMINI_API_KEY를 추가해주세요.")
         else:
-            progress = st.progress(0, text="AI가 스티커를 살펴보는 중...")
-            for i, file_result in enumerate(all_file_results):
-                digest = hashlib.sha256(file_result["bytes"]).hexdigest()[:16]
-                criteria_key = hashlib.md5(
-                    ",".join(selected_criteria).encode("utf-8")
-                ).hexdigest()[:8]
-                market_key = hashlib.md5(
-                    market_context.encode("utf-8")
-                ).hexdigest()[:8]
-                cache_key = f"diag_v4_{file_result['name']}_{digest}_{criteria_key}_{market_key}"
+            completed = _run_ai_diagnostics(
+                all_file_results,
+                selected_criteria,
+                custom_rules,
+                market_context,
+                gemini_key,
+            )
+            if completed:
+                st.success("전체 AI 진단이 끝났어요.")
+            else:
+                st.warning("AI 진단이 완료되지 않은 파일이 있습니다. 잠시 후 다시 시도해 주세요.")
+            _speak_completion()
 
-                if cache_key not in st.session_state:
-                    try:
-                        detailed = diagnose_detailed(
-                            file_result["bytes"],
-                            file_result["mime"],
-                            gemini_key,
-                            selected_criteria=selected_criteria,
-                            market_context=market_context,
-                            custom_criteria=custom_rules,
-                        )
-                        st.session_state[cache_key] = detailed
-                    except Exception as exc:
-                        st.session_state[cache_key] = {
-                            "summary": "진단 중 일시적인 오류가 발생했어요.",
-                            "detail": "Gemini가 일시적으로 사용량이 몰려 응답하지 않았습니다. 자동 재시도와 대체 모델을 시도했으며, 다시 진단하면 정상적으로 처리될 수 있습니다.",
-                            "findings": [],
-                            "strengths": [],
-                            "market_note": "",
-                            "custom_criteria_results": [],
-                            "raw_text": str(exc),
-                        }
-
-                progress.progress(
-                    (i + 1) / len(all_file_results),
-                    text=f"{i + 1}/{len(all_file_results)} 완료",
-                )
-            progress.empty()
-            st.success("전체 AI 진단이 끝났어요.")
 
     # 결과 렌더링
     diagnosis_texts: dict[str, str] = {}
@@ -644,11 +821,14 @@ if files:
         ):
             st.markdown(diagnosis_texts[file_result["name"]])
 
+            if diagnosis.get("diagnosis_error"):
+                st.warning("⚠️ 이번 AI 진단 요청에서 일시적인 오류가 발생했습니다. 아래 진단 결과와 시장 자료가 있다면 계속 참고할 수 있습니다.")
+
             if custom_rules:
                 custom_results = diagnosis.get("custom_criteria_results") or []
                 st.subheader("나만의 검사 기준 결과")
                 returned = {str(item.get("criterion", "")).strip() for item in custom_results if isinstance(item, dict)}
-                st.success(f"사용자 지정 기준 {len(returned)}/{len(custom_rules)}개 개별 평가가 반환되었습니다.")
+                st.success(f"사용자 지정 기준 {len(custom_rules)}개가 이번 AI 요청에 포함됐고, {len(returned)}/{len(custom_rules)}개 개별 평가가 반환되었습니다.")
                 status_icon = {"양호": "🟢", "주의": "🟡", "개선 필요": "🔴", "판단 어려움": "⚪"}
                 for rule in custom_rules:
                     item = next((x for x in custom_results if isinstance(x, dict) and str(x.get("criterion", "")).strip() == rule), None)

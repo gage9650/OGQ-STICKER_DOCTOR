@@ -28,7 +28,7 @@ DIAGNOSIS_SCHEMA: dict[str, Any] = {
                     "why": {"type": "string"},
                     "how": {"type": "string"},
                     "market_basis": {"type": "string"},
-                    "bbox": {"type": "array", "items": {"type": "integer"}},
+                    "bbox": {"type": "array", "items": {"type": "integer"}, "description": "[ymin, xmin, ymax, xmax], each 0~1000. 특정 위치를 확실히 지정할 수 없으면 []"},
                 },
                 "required": ["severity", "area", "what", "why", "how", "market_basis", "bbox"],
             },
@@ -66,10 +66,11 @@ SYSTEM_PROMPT = """당신은 스티커 콘텐츠를 검토하는 AI 진단 도�
 - 심사 통과 확률을 예측하지 마세요.
 - 이미지에서 실제로 확인할 수 없는 사실은 지어내지 마세요.
 - 문제는 가능한 경우 실제 이미지 안의 위치를 bbox로 표시하세요.
-- bbox 좌표는 0~1000 정규화 좌표이며 [left, top, right, bottom] 순서입니다.
+- bbox 좌표는 Gemini 공식 형식인 0~1000 정규화 좌표 [ymin, xmin, ymax, xmax] 순서입니다.
 - 문제 위치를 특정하기 어렵다면 bbox는 []로 두세요.
 - 전체 이미지를 bbox로 지정하는 것은 해당 문제가 실제로 이미지 전체에 걸친 경우에만 허용합니다.
 - 시장 근거를 사용할 때는 전달된 시장 분석 결과에 명시된 사실을 우선 사용하세요.
+- 공개 웹 검색 결과는 보조 참고 자료일 뿐이며, 법적 표절/저작권 침해 여부를 판정하는 근거로 사용하지 마세요.
 - 사용자 태그나 시장 메타데이터만으로 이미지의 실제 모습을 단정하지 마세요.
 - 한 줄 총평은 정확히 한 문장만 작성하세요.
 - detail은 summary를 반복하지 말고 이미지에서 확인되는 근거를 중심으로 3~5문장으로 설명하세요.
@@ -78,7 +79,7 @@ SYSTEM_PROMPT = """당신은 스티커 콘텐츠를 검토하는 AI 진단 도�
 """
 
 TRANSIENT_CODES = {408, 429, 500, 502, 503, 504}
-MODEL_CANDIDATES = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
+MODEL_CANDIDATES = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
 
 
 def _clean_text(value: Any) -> str:
@@ -137,8 +138,10 @@ def _generate_content_with_retry(client, contents, config, model_name: str, atte
             return client.models.generate_content(model=model_name, contents=contents, config=config)
         except (ServerError, APIError) as exc:
             last_error = exc
-            code = getattr(exc, "code", None)
-            if code not in TRANSIENT_CODES or attempt >= attempts - 1:
+            code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+            message = str(exc)
+            transient = code in TRANSIENT_CODES or any(str(c) in message for c in TRANSIENT_CODES)
+            if not transient or attempt >= attempts - 1:
                 raise
             delay = min(8.0, 1.5 * (2**attempt)) + random.uniform(0, 0.5)
             time.sleep(delay)
@@ -180,7 +183,9 @@ def diagnose_detailed(
 - custom_criteria_results에서 각 기준의 result는 '그래서 현재 이미지가 어떤 상태인가'를 한두 문장으로 구체적으로 설명.
 - evidence에는 이미지에서 확인 가능한 근거 또는 선택한 기준에 맞는 관찰을 작성.
 - 커스텀 기준을 평가할 수 없는 경우 '판단 어려움'으로 표시하고 억지로 결론을 만들지 말 것.
-- bbox는 특정 가능한 경우에만 작성.
+- bbox는 특정 가능한 경우에만 작성하며 [ymin, xmin, ymax, xmax] 순서를 지킵니다.
+- bbox는 문제와 직접 관련된 최소한의 영역을 잡고, 이미지 전체를 감싸는 상자는 피하세요.
+- 글씨 문제라면 해당 글씨 줄/단어 영역, 캐릭터 문제라면 해당 캐릭터 부위를 중심으로 잡으세요.
 """
 
     contents = [

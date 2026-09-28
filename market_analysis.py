@@ -117,6 +117,7 @@ def _compact_results(results: list[dict]) -> list[dict[str, Any]]:
                 "published_at": item.get("published_at", ""),
                 "main_image_url": item.get("main_image_url", ""),
                 "visual_match_hint": item.get("visual_match_hint", ""),
+                "visual_match_score": float(item.get("visual_match_score") or 0.0),
             }
         )
     return compact
@@ -232,7 +233,11 @@ def normalize_market_analysis(data: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def build_market_context_for_diagnosis(market_analysis: dict[str, Any], results: list[dict]) -> str:
+def build_market_context_for_diagnosis(
+    market_analysis: dict[str, Any],
+    results: list[dict],
+    public_web_check: dict[str, Any] | None = None,
+) -> str:
     payload = {
         "market_analysis": {
             "similarity_level": market_analysis.get("similarity_level", ""),
@@ -246,8 +251,118 @@ def build_market_context_for_diagnosis(market_analysis: dict[str, Any], results:
             "evidence": list(market_analysis.get("evidence") or [])[:8],
         },
         "ogq_market_results": _compact_results(results),
+        "public_web_check": public_web_check or {},
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def build_public_web_check_prompt(user_feelings: str, user_tags: list[str]) -> str:
+    """Google Search grounding을 이용해 OGQ 밖의 공개 이모티콘/스티커 유사성을 참고 조사한다."""
+    tags = ", ".join(user_tags[:10]) if user_tags else "입력 없음"
+    return f"""사용자의 스티커 콘셉트가 공개 웹에서 흔하게 보이는 이모티콘/스티커 콘셉트와 겹치는지 참고 조사하세요.
+
+사용자 느낌/분위기: {user_feelings or '입력 없음'}
+사용자 태그: {tags}
+
+조사 원칙:
+1. Google Search로 공개적으로 확인 가능한 이모티콘/스티커/캐릭터 상품/콘텐츠를 찾아 참고하세요.
+2. '표절이다', '저작권 침해다'처럼 법적 판단을 내리지 마세요. 이것은 대중적 유사성 참고 조사입니다.
+3. 실제로 검색 결과에서 확인되는 이름, 문구, 캐릭터 콘셉트, 사용 상황처럼 근거가 있는 것만 언급하세요.
+4. 단순히 '강아지', '곰' 같은 일반적인 소재 하나가 같다는 이유만으로 유사하다고 판단하지 마세요.
+5. 특히 '캐릭터 종류 + 표현 방식 + 문구/상황 + 전체 콘셉트'가 함께 겹치는 경우를 중요하게 보세요.
+6. 시각적인 유사성을 웹 텍스트만으로 확정할 수 없다면 그렇게 명시하세요.
+7. 최종 결과는 아래 형식으로 작성하세요.
+
+[공개 웹에서 확인된 대중적 유사성]
+- 2~4개 항목
+
+[겹치는 핵심 요소]
+- 2~4개 항목
+
+[현재 정보만으로 확인하기 어려운 부분]
+- 1~3개 항목
+
+[검토 권장]
+- 1~3개 항목
+"""
+
+
+def _extract_web_sources(response) -> list[dict[str, str]]:
+    sources: list[dict[str, str]] = []
+    try:
+        candidates = getattr(response, "candidates", None) or []
+        for candidate in candidates:
+            metadata = getattr(candidate, "grounding_metadata", None)
+            chunks = getattr(metadata, "grounding_chunks", None) if metadata else None
+            for chunk in chunks or []:
+                web = getattr(chunk, "web", None)
+                if not web:
+                    continue
+                uri = str(getattr(web, "uri", "") or "").strip()
+                title = str(getattr(web, "title", "") or uri).strip()
+                if uri and uri not in {item["uri"] for item in sources}:
+                    sources.append({"title": title, "uri": uri})
+    except Exception:
+        pass
+    return sources[:8]
+
+
+def generate_public_web_check(
+    gemini_key: str,
+    user_feelings: str,
+    user_tags: list[str],
+    *,
+    max_output_tokens: int = 900,
+) -> dict[str, Any]:
+    """Google Search grounding으로 공개 웹의 대중적 유사성만 보조 조사한다."""
+    from google import genai
+    from google.genai import types
+    from google.genai.errors import APIError, ServerError
+    import random
+    import time
+
+    client = genai.Client(api_key=gemini_key)
+    prompt = build_public_web_check_prompt(user_feelings, user_tags)
+    models = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
+    grounding_tool = types.Tool(google_search=types.GoogleSearch())
+    last_error: Exception | None = None
+
+    for model_name in models:
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        tools=[grounding_tool],
+                        max_output_tokens=max_output_tokens,
+                        temperature=0.2,
+                    ),
+                )
+                return {
+                    "text": (response.text or "").strip(),
+                    "sources": _extract_web_sources(response),
+                    "model_used": model_name,
+                }
+            except (ServerError, APIError) as exc:
+                last_error = exc
+                code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+                message = str(exc)
+                transient = code in {408, 429, 500, 502, 503, 504} or any(str(c) in message for c in {408,429,500,502,503,504})
+                if transient and attempt < 1:
+                    time.sleep(min(5.0, 1.2 * (2 ** attempt)) + random.uniform(0, 0.3))
+                    continue
+                if not transient:
+                    break
+            except Exception as exc:
+                last_error = exc
+                break
+
+    return {
+        "text": "",
+        "sources": [],
+        "error": f"공개 웹 유사성 참고 조사를 완료하지 못했습니다: {last_error}",
+    }
 
 
 def _visual_hash(image_bytes: bytes) -> list[int] | None:
@@ -278,6 +393,7 @@ def annotate_visual_match_hints(user_image_bytes: bytes, results: list[dict], th
     user_hash = _visual_hash(user_image_bytes)
     for item in results:
         item["visual_match_hint"] = ""
+        item["visual_match_score"] = 0.0
         url = item.get("main_image_url") or item.get("thumbnail_url")
         if not url or not user_hash:
             continue
@@ -285,6 +401,7 @@ def annotate_visual_match_hints(user_image_bytes: bytes, results: list[dict], th
             r = requests.get(url, timeout=6)
             r.raise_for_status()
             score = _hash_similarity(user_hash, _visual_hash(r.content))
+            item["visual_match_score"] = round(score, 4)
             if score >= threshold:
                 item["visual_match_hint"] = f"강한 시각적 일치 신호({score:.0%})"
             elif score >= 0.85:
