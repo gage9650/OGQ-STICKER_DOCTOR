@@ -13,7 +13,11 @@ from PIL import Image, ImageDraw
 from checker import SPECS, check_image
 from diagnosis import diagnose_detailed, render_diagnosis_markdown
 from criteria import DEFAULT_CRITERIA, PLATFORM_PRESETS, build_selected_criteria
-from market_analysis import build_market_analysis_prompt
+from market_analysis import (
+    build_market_analysis_prompt,
+    build_market_context_for_diagnosis,
+    normalize_market_analysis,
+)
 from ogq_market import OGQAPIError, search_by_keywords
 from report_utils import (
     build_pdf_report,
@@ -177,53 +181,72 @@ def _generate_market_ai(
     market_prompt: str,
     *,
     max_output_tokens: int = 1400,
-) -> tuple[str, str | None]:
-    """시장 비교 AI를 호출한다.
+) -> tuple[dict, str | None]:
+    """시장 비교 AI를 구조화된 JSON으로 호출한다.
 
-    3.8 → 3.7 → 3.6 순으로 ServerError가 발생했을 때만 fallback한다.
-    AI 실패 시에도 OGQ 검색 결과 자체는 계속 사용할 수 있도록 예외를 문자열로 돌려준다.
+    구조화된 출력(response_schema)을 사용해 Markdown/JSON 파싱 실패를 줄인다.
+    일시적인 5xx/ServerError가 발생하면 모델 fallback을 시도한다.
     """
     from google import genai
     from google.genai import types
     from google.genai.errors import APIError, ServerError
 
     client = genai.Client(api_key=gemini_key)
-    models = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"]
+    models = ["gemini-3.8-flash", "gemini-3.6-flash"]
     last_error: Exception | None = None
 
     for model_name in models:
-        for attempt in range(2):
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=market_prompt,
-                    config=types.GenerateContentConfig(
-                        max_output_tokens=max_output_tokens,
-                    ),
-                )
-                text = (response.text or "").strip()
-                if text:
-                    return text, None
-                return "", f"{model_name}이 빈 응답을 반환했습니다."
-            except ServerError as exc:
-                last_error = exc
-                if attempt == 0:
-                    time.sleep(1.0)
-                    continue
-                break
-            except APIError as exc:
-                last_error = exc
-                # 5xx 계열만 다음 모델로 fallback. 인증/쿼터/요청 오류는 숨기지 않는다.
-                code = getattr(exc, "code", None)
-                if isinstance(code, int) and 500 <= code < 600:
-                    break
-                return "", f"Gemini API 오류({code or '알 수 없음'}): {str(exc)}"
-            except Exception as exc:
-                last_error = exc
-                break
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=market_prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=MARKET_SCHEMA,
+                    max_output_tokens=max_output_tokens,
+                    temperature=0.2,
+                ),
+            )
+            raw = (response.text or "").strip()
+            if not raw:
+                return {}, f"{model_name}이 빈 응답을 반환했습니다."
 
-    detail = str(last_error) if last_error else "알 수 없는 오류"
-    return "", f"Gemini 시장 비교 분석에 실패했습니다. 검색 결과는 정상적으로 표시할 수 있습니다. ({detail})"
+            try:
+                import json
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                # 구조화 출력이 깨진 경우 마지막 안전망으로 첫 JSON 객체를 찾는다.
+                import json
+                start = raw.find("{")
+                end = raw.rfind("}")
+                if start >= 0 and end > start:
+                    try:
+                        parsed = json.loads(raw[start : end + 1])
+                    except json.JSONDecodeError as exc:
+                        return {}, f"시장 분석 JSON을 읽지 못했습니다: {exc}"
+                else:
+                    return {}, "시장 분석 결과가 올바른 JSON 형식이 아닙니다."
+
+            return normalize_market_analysis(parsed), None
+
+        except ServerError as exc:
+            last_error = exc
+            continue
+        except APIError as exc:
+            last_error = exc
+            code = getattr(exc, "code", None)
+            if isinstance(code, int) and 500 <= code < 600:
+                continue
+            return {}, f"Gemini API 오류({code or '알 수 없음'}): {str(exc)}"
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    return {}, (
+        "Gemini 시장 비교 분석에 실패했습니다. "
+        "검색된 OGQ 콘텐츠는 정상적으로 확인할 수 있습니다. "
+        f"({last_error})"
+    )
 
 
 # ---------- 0단계: 검사 기준 ----------
@@ -329,7 +352,7 @@ if files:
         # 이전 결과를 먼저 비워서 검색 실패 시 오래된 결과가 보이지 않도록 한다.
         st.session_state.pop("market_results", None)
         st.session_state.pop("market_analysis", None)
-        st.session_state.pop("market_prompt", None)
+        st.session_state.pop("market_context", None)
         st.session_state.pop("market_analysis_error", None)
 
         ogq_api_key = _get_secret("OGQ_API_KEY")
@@ -366,7 +389,6 @@ if files:
                             user_tags,
                             market_results[:8],
                         )
-                        st.session_state["market_prompt"] = market_prompt
 
                         gemini_key = _get_secret("GEMINI_API_KEY")
                         if gemini_key:
@@ -374,10 +396,16 @@ if files:
                                 analysis, error_message = _generate_market_ai(
                                     gemini_key,
                                     market_prompt,
-                                    max_output_tokens=1400,
+                                    max_output_tokens=1500,
                                 )
                             if analysis:
                                 st.session_state["market_analysis"] = analysis
+                                # 이미지 진단에는 '분석을 위한 프롬프트'가 아니라
+                                # 실제 생성된 시장 분석 결과만 전달한다.
+                                st.session_state["market_context"] = build_market_context_for_diagnosis(
+                                    analysis,
+                                    market_results[:8],
+                                )
                             if error_message:
                                 st.session_state["market_analysis_error"] = error_message
                         else:
@@ -409,9 +437,68 @@ if files:
                 if tags:
                     st.caption("태그: " + ", ".join(f"#{tag}" for tag in tags[:6]))
 
-        if st.session_state.get("market_analysis"):
+        market_analysis = st.session_state.get("market_analysis")
+        if isinstance(market_analysis, dict):
             st.subheader("AI 시장 비교")
-            st.markdown(st.session_state["market_analysis"])
+
+            level = market_analysis.get("similarity_level", "보통")
+            level_emoji = {"높음": "🔴", "보통": "🟡", "낮음": "🟢"}.get(level, "🟡")
+            st.markdown(f"**시장 유사성: {level_emoji} {level}**")
+            if market_analysis.get("similarity_summary"):
+                st.write(market_analysis["similarity_summary"])
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**비슷하게 나타나는 요소**")
+                similarities = market_analysis.get("similarities") or []
+                if similarities:
+                    for item in similarities:
+                        st.markdown(f"- {item}")
+                else:
+                    st.caption("검색 결과에서 뚜렷하게 겹치는 요소를 찾지 못했습니다.")
+            with c2:
+                st.markdown("**구별되는 요소**")
+                differences = market_analysis.get("differences") or []
+                if differences:
+                    for item in differences:
+                        st.markdown(f"- {item}")
+                else:
+                    st.caption("검색 데이터만으로 확인되는 뚜렷한 차별점을 찾지 못했습니다.")
+
+            st.markdown("**시장과 비교했을 때의 장점**")
+            for item in (market_analysis.get("strengths") or []):
+                st.markdown(f"- {item}")
+            if not market_analysis.get("strengths"):
+                st.caption("검색 결과만으로 판단할 수 있는 장점을 찾지 못했습니다.")
+
+            st.markdown("**보완하면 좋은 점**")
+            for item in (market_analysis.get("gaps") or []):
+                st.markdown(f"- {item}")
+            if not market_analysis.get("gaps"):
+                st.caption("검색 결과만으로 확인되는 보완점이 없습니다.")
+
+            priority = market_analysis.get("priority_actions") or []
+            if priority:
+                st.markdown("**먼저 확인할 것**")
+                for idx, item in enumerate(priority, 1):
+                    st.markdown(f"{idx}. {item}")
+
+            evidence = market_analysis.get("evidence") or []
+            if evidence:
+                with st.expander("시장 분석 근거 보기"):
+                    for item in evidence:
+                        idx = item.get("result_index")
+                        reason = item.get("reason", "")
+                        if idx and 1 <= int(idx) <= len(market_results[:8]):
+                            source = market_results[int(idx) - 1]
+                            st.markdown(
+                                f"**[{idx}] {source.get('title', '콘텐츠')}** — {reason}"
+                            )
+
+        elif st.session_state.get("market_analysis"):
+            # 이전 버전의 문자열 결과가 세션에 남아도 화면이 깨지지 않도록 호환
+            st.subheader("AI 시장 비교")
+            st.markdown(str(st.session_state["market_analysis"]))
 
         if st.session_state.get("market_analysis_error"):
             st.warning(st.session_state["market_analysis_error"])
@@ -421,7 +508,7 @@ if files:
     st.header("4단계 · AI가 어디가 문제인지 표시")
     st.caption("선택한 검사 영역과 시장 비교 자료를 바탕으로 문제 영역을 표시하고, 무엇을/왜/어떻게 고칠지 설명합니다.")
 
-    market_context = st.session_state.get("market_prompt", "")
+    market_context = st.session_state.get("market_context", "")
 
     if st.button(f"🧠 업로드한 {len(files)}개 전체 AI 진단 받기", type="primary"):
         gemini_key = _get_secret("GEMINI_API_KEY")
