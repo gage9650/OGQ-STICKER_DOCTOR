@@ -4,10 +4,14 @@ from __future__ import annotations
 import json
 
 
-def build_market_context(user_feelings: str, user_tags: list[str], results: list[dict]) -> str:
-    """OGQ 결과를 너무 길지 않게 AI 컨텍스트로 만든다."""
+def build_market_context(
+    user_feelings: str,
+    user_tags: list[str],
+    results: list[dict],
+) -> str:
+    """OGQ 결과를 짧고 명확하게 AI 컨텍스트로 만든다."""
     compact = []
-    for i, item in enumerate(results[:20], start=1):
+    for i, item in enumerate(results[:8], start=1):
         compact.append(
             {
                 "index": i,
@@ -15,8 +19,11 @@ def build_market_context(user_feelings: str, user_tags: list[str], results: list
                 "description": item.get("description", ""),
                 "creator": item.get("creator_name", ""),
                 "matched_keyword": item.get("matched_keyword", ""),
+                "tags": item.get("tags", [])[:10],
+                "published_at": item.get("published_at", ""),
             }
         )
+
     return json.dumps(
         {
             "user_feelings": user_feelings,
@@ -28,7 +35,11 @@ def build_market_context(user_feelings: str, user_tags: list[str], results: list
     )
 
 
-def build_market_analysis_prompt(user_feelings: str, user_tags: list[str], results: list[dict]) -> str:
+def build_market_analysis_prompt(
+    user_feelings: str,
+    user_tags: list[str],
+    results: list[dict],
+) -> str:
     context = build_market_context(user_feelings, user_tags, results)
     return f"""아래는 사용자가 설명한 자신의 스티커 특성과 OGQ 마켓 검색 결과입니다.
 
@@ -54,12 +65,13 @@ def build_market_analysis_prompt(user_feelings: str, user_tags: list[str], resul
 
 ### 보완하면 좋은 점
 시장 결과에서 반복적으로 보이는 요소와 비교해 부족해 보일 수 있는 부분을 설명하세요.
-단, '심사에서 반드시 탈락한다'거나 '판매가 안 된다'고 단정하지 마세요.
+심사에서 반드시 탈락한다거나 판매가 안 된다고 단정하지 마세요.
 
 ### 가장 먼저 확인할 것
 제작자가 다음 수정에서 우선적으로 확인할 3가지를 순서대로 제시하세요.
 
 주의:
 - 이것은 시장 참고 분석이지 OGQ 내부 심사 결과 예측이 아닙니다.
-- OGQ 검색 API에서 받은 제목/설명 등 확인 가능한 데이터만 근거로 사용하세요.
+- OGQ 검색 API에서 받은 제목·설명·태그 등 확인 가능한 데이터만 근거로 사용하세요.
+- 시장 데이터와 사용자 입력으로 확인할 수 없는 내용은 추측하지 마세요.
 """
