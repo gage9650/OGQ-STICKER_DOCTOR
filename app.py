@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import io
 import json
 import time
 
@@ -24,7 +26,16 @@ from market_analysis import (
     generate_public_web_check,
 )
 from ogq_market import OGQAPIError, search_by_keywords
-from user_store import create_user, load_user_diagnosis_history, save_diagnosis_record, verify_user
+from user_store import (
+    create_user,
+    load_user_diagnosis_history,
+    save_diagnosis_record,
+    verify_user,
+    save_review,
+    load_reviews_for_record,
+    load_public_reviews,
+    load_all_reviews,
+)
 from report_utils import (
     build_pdf_report,
     build_priority_todo,
@@ -169,7 +180,6 @@ st.markdown(
 
 st.caption(f"현재 로그인: {current_user}")
 
-
 def _draw_annotations(file_bytes: bytes, findings: list[dict]) -> Image.Image:
     """Gemini 공식 bbox 형식 [ymin, xmin, ymax, xmax]을 실제 이미지 좌표로 변환한다."""
     import io
@@ -296,6 +306,312 @@ def _get_secret(name: str, default: str = "") -> str:
     except Exception:
         value = default
     return str(value or "").strip()
+
+
+def _is_developer(username: str) -> bool:
+    """Streamlit Secrets의 DEVELOPER_USERNAMES에 등록된 계정인지 확인한다."""
+    raw = _get_secret("DEVELOPER_USERNAMES")
+    allowed = {item.strip() for item in raw.split(",") if item.strip()}
+    return username.strip() in allowed
+
+
+def _history_image_b64(file_bytes: bytes, findings: list[dict] | None = None, max_side: int = 420) -> str:
+    """히스토리에서 다시 볼 수 있도록 문제 표시 이미지의 작은 PNG를 저장한다."""
+    try:
+        image = _draw_annotations(file_bytes, findings or [])
+        image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        image.save(buf, format="PNG", optimize=True)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        return ""
+
+
+def _safe_market_results_for_history(results: list[dict]) -> list[dict]:
+    cleaned: list[dict] = []
+    for item in results[:8]:
+        if not isinstance(item, dict):
+            continue
+        cleaned.append(
+            {
+                "content_id": item.get("content_id") or item.get("asset_id") or item.get("assetId") or "",
+                "title": item.get("title", ""),
+                "description": item.get("description", ""),
+                "main_image_url": item.get("main_image_url") or item.get("thumbnail_url") or item.get("thumbnailUrl") or "",
+                "creator_name": item.get("creator_name") or item.get("creator", {}).get("nickname", "") if isinstance(item.get("creator"), dict) else item.get("creator_name", ""),
+                "published_at": item.get("published_at") or item.get("publishedAt") or "",
+                "tags": list(item.get("tags") or [])[:10],
+                "matched_keyword": item.get("matched_keyword", ""),
+                "visual_match_score": item.get("visual_match_score", 0),
+                "visual_match_hint": item.get("visual_match_hint", ""),
+            }
+        )
+    return cleaned
+
+
+def _build_history_payload(
+    all_file_results: list[dict],
+    selected_criteria: list[str],
+    custom_rules: list[str],
+    feelings: str,
+    user_tags: list[str],
+) -> dict:
+    files_payload: dict[str, dict] = {}
+    for file_result in all_file_results:
+        digest = hashlib.sha256(file_result["bytes"]).hexdigest()[:16]
+        cache_prefix = f"diag_v5_{file_result['name']}_{digest}_"
+        matched_keys = [
+            key for key in st.session_state.keys()
+            if isinstance(key, str) and key.startswith(cache_prefix)
+        ]
+        diagnosis = st.session_state[matched_keys[-1]] if matched_keys else {}
+        findings = diagnosis.get("findings", []) if isinstance(diagnosis, dict) else []
+        files_payload[file_result["name"]] = {
+            "img_type": file_result.get("img_type"),
+            "results": file_result.get("results", []),
+            "diagnosis": diagnosis,
+            "annotated_image_b64": _history_image_b64(file_result["bytes"], findings),
+        }
+
+    return {
+        "history_version": 2,
+        "feelings": feelings,
+        "user_tags": user_tags,
+        "selected_criteria": selected_criteria,
+        "custom_rules": custom_rules,
+        "market_analysis": st.session_state.get("market_analysis", {}),
+        "market_results": _safe_market_results_for_history(st.session_state.get("market_results", [])),
+        "public_web_check": st.session_state.get("public_web_check", {}),
+        "files": files_payload,
+        "market_auto_diagnose": bool(st.session_state.get("auto_diagnose_after_market", False)),
+    }
+
+
+def _render_review_for_history(current_user: str, record: dict, developer_mode: bool = False) -> None:
+    """선택한 히스토리에 대한 사용자 리뷰를 입력하고 기존 리뷰를 보여준다."""
+    st.subheader("📝 이 진단에 대한 리뷰")
+    st.caption("리뷰는 다음 AI 피드백을 개선하기 위한 데이터로 활용할 수 있습니다. 한 진단당 한 번 작성하며, 다시 제출하면 수정됩니다.")
+
+    existing = load_reviews_for_record(record["id"], include_developer_only=True)
+    own = next((r for r in existing if r.get("username") == current_user), None)
+
+    with st.form(f"review_form_{record['id']}"):
+        overall = st.slider("전체 만족도", 1, 5, int(own["overall_rating"]) if own else 4)
+        usefulness = st.slider("도움이 된 정도", 1, 5, int(own["usefulness_rating"]) if own else 4)
+        accuracy = st.slider("진단 정확도", 1, 5, int(own["accuracy_rating"]) if own else 4)
+        issue_tags = st.multiselect(
+            "아쉬웠던 부분 (여러 개 선택 가능)",
+            [
+                "문제 위치가 부정확함",
+                "시장 비교가 부정확함",
+                "비슷한 콘텐츠 판단이 아쉬움",
+                "설명이 너무 일반적임",
+                "수정 방법이 구체적이지 않음",
+                "오탈자/텍스트 인식이 부정확함",
+                "결과가 너무 길거나 복잡함",
+                "특별한 아쉬움 없음",
+            ],
+            default=(own.get("issue_tags", []) if own else []),
+        )
+        comment = st.text_area(
+            "추가 의견",
+            value=(own.get("comment", "") if own else ""),
+            placeholder="예: 시장의 유사 스티커는 잘 찾았지만, 왜 비슷한지 설명이 조금 더 구체적이면 좋겠습니다.",
+        )
+        visibility_label = st.radio(
+            "리뷰 공개 범위",
+            ["모두 공개", "개발자만 보기"],
+            index=0 if not own or own.get("visibility") == "public" else 1,
+            horizontal=True,
+            help="모두 공개: 다른 사용자도 볼 수 있습니다. 개발자만 보기: 개발자 계정만 볼 수 있습니다.",
+        )
+        submitted = st.form_submit_button("리뷰 저장", type="primary")
+
+    if submitted:
+        review_id = save_review(
+            current_user,
+            record["id"],
+            overall_rating=overall,
+            usefulness_rating=usefulness,
+            accuracy_rating=accuracy,
+            issue_tags=issue_tags,
+            comment=comment,
+            visibility="public" if visibility_label == "모두 공개" else "developer",
+        )
+        if review_id:
+            st.success("리뷰가 저장됐어요. 다음 진단을 개선하는 데 활용할 수 있습니다.")
+            st.rerun()
+        else:
+            st.error("리뷰 저장에 실패했습니다.")
+
+    if existing:
+        st.markdown("**이 진단에 남겨진 리뷰**")
+        visible_reviews = existing if developer_mode else [r for r in existing if r.get("visibility") == "public" or r.get("username") == current_user]
+        for review in visible_reviews:
+            visibility_text = "모두 공개" if review.get("visibility") == "public" else "개발자만"
+            st.markdown(
+                f"**{review.get('username', '사용자')}** · {'⭐' * int(review.get('overall_rating', 0))} · {visibility_text} · {review.get('timestamp', '')}"
+            )
+            st.caption(
+                f"도움 {review.get('usefulness_rating', 0)}/5 · 정확도 {review.get('accuracy_rating', 0)}/5"
+            )
+            if review.get("issue_tags"):
+                st.caption(" · ".join(review["issue_tags"]))
+            if review.get("comment"):
+                st.write(review["comment"])
+
+
+def _render_history_detail(current_user: str, record: dict, developer_mode: bool = False) -> None:
+    payload = record.get("diagnosis") or {}
+    st.markdown(
+        f"### 검사 #{record['id']} · {record['timestamp']} · {record['score']:.0f}점" if record.get("score") is not None else f"### 검사 #{record['id']} · {record['timestamp']}"
+    )
+    st.caption(
+        f"파일 {record['file_count']}개 · PASS {record['pass']} · WARN {record['warn']} · FAIL {record['fail']} · 체크리스트 {record['checklist']}"
+    )
+    if record.get("market_keywords"):
+        st.write("시장 검색어: " + ", ".join(record["market_keywords"]))
+
+    if payload.get("feelings"):
+        st.write("느낌/분위기: " + payload["feelings"])
+    if payload.get("user_tags"):
+        st.write("사용자 태그: " + ", ".join(f"#{t}" for t in payload["user_tags"]))
+
+    with st.expander("적용된 검사 기준", expanded=False):
+        selected = payload.get("selected_criteria") or []
+        custom = payload.get("custom_rules") or []
+        st.success(f"기본/공개 기준 {max(0, len(selected) - len(custom))}개 + 나만의 기준 {len(custom)}개 적용")
+        for criterion in selected:
+            st.write("✓ " + criterion)
+
+    market = payload.get("market_analysis") or {}
+    if market:
+        st.markdown("### 📊 AI 시장 비교 결과")
+        level = market.get("similarity_level", "보통")
+        st.write(f"시장 유사성: **{level}**")
+        if market.get("similarity_summary"):
+            st.write(market["similarity_summary"])
+        if market.get("differences"):
+            st.markdown("**시장과의 차이점**")
+            for item in market["differences"]:
+                st.write("- " + item)
+        if market.get("gaps"):
+            st.markdown("**보완하면 좋은 점**")
+            for item in market["gaps"]:
+                st.write("- " + item)
+
+    history_files = payload.get("files") or {}
+    if history_files:
+        st.markdown("### 🔴 AI 문제 위치 기록")
+        for filename, item in history_files.items():
+            diagnosis = item.get("diagnosis") or {}
+            with st.expander(filename, expanded=False):
+                image_b64 = item.get("annotated_image_b64")
+                if image_b64:
+                    try:
+                        st.image(base64.b64decode(image_b64), caption="저장된 AI 문제 위치 표시", use_container_width=True)
+                    except Exception:
+                        pass
+                st.markdown(f"**한 줄 총평:** {diagnosis.get('summary', '기록 없음')}")
+                if diagnosis.get("detail"):
+                    st.write(diagnosis["detail"])
+                findings = diagnosis.get("findings") or []
+                for idx, finding in enumerate(findings, 1):
+                    st.markdown(
+                        f"**{idx}. {finding.get('area', '검토 항목')}** · {finding.get('severity', '')}"
+                    )
+                    st.write(f"- 어디가: {finding.get('what', '')}")
+                    st.write(f"- 왜: {finding.get('why', '')}")
+                    st.write(f"- 어떻게: {finding.get('how', '')}")
+                    if finding.get("market_basis"):
+                        st.caption("시장 근거: " + finding["market_basis"])
+                custom_results = diagnosis.get("custom_criteria_results") or []
+                if custom_results:
+                    st.markdown("**나만의 검사 기준 결과**")
+                    for result in custom_results:
+                        st.write(f"{result.get('status', '판단 어려움')} · {result.get('criterion', '')}: {result.get('result', '')}")
+
+    _render_review_for_history(current_user, record, developer_mode=developer_mode)
+
+
+def _render_history_center(current_user: str) -> None:
+    """업로드 여부와 무관하게 언제든지 사용자 히스토리/리뷰를 볼 수 있는 영역."""
+    history = load_user_diagnosis_history(current_user, limit=50)
+    with st.expander("📚 내 진단 히스토리", expanded=bool(history)):
+        if not history:
+            st.info("아직 저장된 진단 히스토리가 없습니다. 검사를 저장하면 여기에 계속 남습니다.")
+            return
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("저장된 검사", len(history))
+        with col2:
+            st.metric("최근 점수", f"{history[-1]['score']:.0f}" if history[-1].get("score") is not None else "-")
+        with col3:
+            avg = sum(float(h.get("score") or 0) for h in history) / max(1, len(history))
+            st.metric("평균 점수", f"{avg:.0f}")
+
+        if len(history) >= 2:
+            st.line_chart({"score": [h["score"] for h in history]})
+
+        labels = {
+            h["id"]: f"검사 #{h['id']} · {h['timestamp']} · {h['score']:.0f}점 · 파일 {h['file_count']}개"
+            for h in reversed(history)
+        }
+        selected_id = st.selectbox(
+            "확인할 히스토리",
+            options=list(labels.keys()),
+            format_func=lambda value: labels[value],
+            key="history_selected_id",
+        )
+        selected_record = next(h for h in history if h["id"] == selected_id)
+        _render_history_detail(current_user, selected_record, developer_mode=_is_developer(current_user))
+
+    public_reviews = load_public_reviews(limit=12)
+    with st.expander("💬 다른 사용자의 공개 리뷰", expanded=False):
+        if not public_reviews:
+            st.caption("아직 공개 리뷰가 없습니다.")
+        else:
+            for review in public_reviews:
+                st.markdown(
+                    f"**{review.get('username', '사용자')}** · {'⭐' * int(review.get('overall_rating', 0))} · 검사 #{review.get('record_id')}"
+                )
+                st.caption(
+                    f"도움 {review.get('usefulness_rating', 0)}/5 · 정확도 {review.get('accuracy_rating', 0)}/5 · {review.get('timestamp', '')}"
+                )
+                if review.get("issue_tags"):
+                    st.caption(" · ".join(review["issue_tags"]))
+                if review.get("comment"):
+                    st.write(review["comment"])
+                st.divider()
+
+    if _is_developer(current_user):
+        reviews = load_all_reviews(limit=100)
+        with st.expander("🛠 개발자 리뷰 대시보드", expanded=False):
+            if not reviews:
+                st.caption("아직 리뷰 데이터가 없습니다.")
+            else:
+                avg_overall = sum(r["overall_rating"] for r in reviews) / len(reviews)
+                avg_useful = sum(r["usefulness_rating"] for r in reviews) / len(reviews)
+                avg_acc = sum(r["accuracy_rating"] for r in reviews) / len(reviews)
+                a, b, c = st.columns(3)
+                a.metric("리뷰 수", len(reviews))
+                b.metric("평균 만족도", f"{avg_overall:.1f}/5")
+                c.metric("평균 정확도", f"{avg_acc:.1f}/5")
+                st.caption(f"평균 도움 정도: {avg_useful:.1f}/5 · 공개/개발자 전용 리뷰 모두 포함")
+                for review in reviews[:30]:
+                    visibility = "공개" if review["visibility"] == "public" else "개발자 전용"
+                    st.markdown(
+                        f"**검사 #{review['record_id']} · {review['username']} · {'⭐' * review['overall_rating']} · {visibility}**"
+                    )
+                    st.caption(
+                        f"도움 {review['usefulness_rating']}/5 · 정확도 {review['accuracy_rating']}/5 · {review['timestamp']}"
+                    )
+                    if review.get("issue_tags"):
+                        st.write("문제 태그: " + ", ".join(review["issue_tags"]))
+                    if review.get("comment"):
+                        st.write(review["comment"])
+                    st.divider()
 
 
 def _keywords_from_user_input(feelings: str, user_tags: list[str], limit: int = 5) -> list[str]:
@@ -460,6 +776,8 @@ def _run_ai_diagnostics(
     progress.empty()
     return had_success
 
+
+_render_history_center(current_user)
 
 # ---------- 0단계: 검사 기준 ----------
 st.header("검사 기준 설정")
@@ -1015,6 +1333,7 @@ if files:
             )
 
     with col_b:
+        st.caption("저장하면 점수뿐 아니라 시장 비교, AI 문제 위치 표시, 적용된 검사 기준, 사용자 지정 기준 결과까지 함께 보관됩니다.")
         if st.button("💾 이번 결과를 히스토리에 저장"):
             pass_count = sum(
                 1
@@ -1034,17 +1353,6 @@ if files:
                 for grade, _, _ in fr["results"]
                 if grade == "fail"
             )
-            diagnosis_payload = {}
-            for file_result in all_file_results:
-                digest = hashlib.sha256(file_result["bytes"]).hexdigest()[:16]
-                cache_prefix = f"diag_v5_{file_result['name']}_{digest}_"
-                matched_keys = [
-                    key for key in st.session_state.keys()
-                    if isinstance(key, str) and key.startswith(cache_prefix)
-                ]
-                if matched_keys:
-                    diagnosis_payload[file_result["name"]] = st.session_state[matched_keys[-1]]
-
             record_id = save_diagnosis_record(
                 current_user,
                 score=score,
@@ -1055,32 +1363,19 @@ if files:
                 checklist_total=checklist_total,
                 file_count=len(all_file_results),
                 market_keywords=_keywords_from_user_input(feelings, user_tags, limit=5),
-                diagnosis_payload={
-                    "market_analysis": st.session_state.get("market_analysis", {}),
-                    "files": diagnosis_payload,
-                },
+                diagnosis_payload=_build_history_payload(
+                    all_file_results,
+                    selected_criteria,
+                    custom_rules,
+                    feelings,
+                    user_tags,
+                ),
             )
             if record_id:
-                st.success("내 계정의 진단 히스토리에 저장했어요.")
+                st.success("내 계정의 진단 히스토리에 저장했어요. 상단의 '내 진단 히스토리'에서 언제든지 다시 볼 수 있습니다.")
+                st.rerun()
             else:
                 st.error("사용자 기록 저장에 실패했습니다.")
-
-    history = load_user_diagnosis_history(current_user)
-    if len(history) >= 2:
-        st.subheader(f"{current_user}님의 재검사 히스토리")
-        st.line_chart({"score": [h["score"] for h in history]})
-        st.caption(
-            f"최근 {len(history)}회 검사 · 마지막: {history[-1]['timestamp']} ({history[-1]['score']}점)"
-        )
-        with st.expander("저장된 최근 진단 확인"):
-            latest = history[-1]
-            st.write(f"파일 {latest['file_count']}개 · 체크리스트 {latest['checklist']}")
-            if latest.get("market_keywords"):
-                st.write("시장 검색어: " + ", ".join(latest["market_keywords"]))
-    elif len(history) == 1:
-        st.caption("내 히스토리가 1개예요. 수정 후 다시 저장하면 변화 그래프가 나타납니다.")
-    else:
-        st.caption("아직 저장된 진단 히스토리가 없습니다.")
 
     # ---------- 제출 구성 요약 ----------
     st.divider()
