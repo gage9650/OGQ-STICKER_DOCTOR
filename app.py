@@ -191,7 +191,7 @@ def _speak_completion(message: str = "") -> None:
 
               const gain = ctx.createGain();
               gain.gain.setValueAtTime(0.0001, now);
-              gain.gain.exponentialRampToValueAtTime(0.22, now + 0.015);
+              gain.gain.exponentialRampToValueAtTime(0.42, now + 0.015);
               gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.42);
               gain.connect(ctx.destination);
 
@@ -538,6 +538,13 @@ if files:
         help="체크하면 시장 비교와 시장 분석이 끝난 직후 선택한 검사 기준으로 AI 진단을 자동 실행합니다.",
     )
 
+    public_web_enabled = st.checkbox(
+        "Google 공개 웹 유사성 참고 조사도 실행",
+        value=False,
+        key="public_web_enabled",
+        help="OGQ 시장 분석과 별도로 공개 웹을 참고합니다. 추가 Gemini 요청이 발생하므로 필요할 때만 켜는 것을 권장합니다.",
+    )
+
     if st.button("🔎 OGQ 시장과 비교하기", type="primary"):
         # 이전 결과를 먼저 비워서 검색 실패 시 오래된 결과가 보이지 않도록 한다.
         st.session_state.pop("market_results", None)
@@ -607,18 +614,23 @@ if files:
                             if analysis:
                                 st.session_state["market_analysis"] = analysis
 
-                                # OGQ 데이터와 별개로, 공개 웹에서 대중적 유사성도 보조 조사한다.
-                                web_check = generate_public_web_check(
-                                    gemini_key,
-                                    feelings,
-                                    user_tags,
-                                )
-                                if web_check.get("text"):
-                                    st.session_state["public_web_check"] = web_check
-                                elif web_check.get("error"):
-                                    st.session_state["public_web_check_error"] = web_check["error"]
+                                # 공개 웹 조사는 선택 사항으로 분리한다.
+                                # 시장 비교 자체가 추가 Gemini 검색 호출 때문에 막히지 않도록 한다.
+                                if public_web_enabled:
+                                    web_check = generate_public_web_check(
+                                        gemini_key,
+                                        feelings,
+                                        user_tags,
+                                    )
+                                    if web_check.get("text"):
+                                        st.session_state["public_web_check"] = web_check
+                                    elif web_check.get("error"):
+                                        st.session_state["public_web_check_error"] = web_check["error"]
+                                else:
+                                    st.session_state["public_web_check"] = {}
+                                    st.session_state["public_web_check_error"] = "공개 웹 유사성 참고 조사는 선택하지 않아 실행하지 않았습니다. OGQ 시장 비교 분석에는 영향을 주지 않습니다."
 
-                                # 이미지 진단에는 실제 시장 분석 + 공개 웹 보조 조사 결과를 전달한다.
+                                # 이미지 진단에는 실제 시장 분석 + (실행했다면) 공개 웹 보조 조사 결과를 전달한다.
                                 st.session_state["market_context"] = build_market_context_for_diagnosis(
                                     analysis,
                                     market_results[:8],
@@ -803,7 +815,7 @@ if files:
     diagnosis_texts: dict[str, str] = {}
     for file_result in all_file_results:
         digest = hashlib.sha256(file_result["bytes"]).hexdigest()[:16]
-        cache_prefix = f"diag_v4_{file_result['name']}_{digest}_"
+        cache_prefix = f"diag_v5_{file_result['name']}_{digest}_"
         matched_keys = [
             key
             for key in st.session_state.keys()
