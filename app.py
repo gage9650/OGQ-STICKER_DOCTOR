@@ -24,12 +24,11 @@ from market_analysis import (
     generate_public_web_check,
 )
 from ogq_market import OGQAPIError, search_by_keywords
+from user_store import create_user, load_user_diagnosis_history, save_diagnosis_record, verify_user
 from report_utils import (
     build_pdf_report,
     build_priority_todo,
     compute_score,
-    load_history,
-    save_history_entry,
 )
 
 
@@ -99,6 +98,65 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
+def _render_auth_gate() -> str | None:
+    """프로토타입 로그인/회원가입 화면."""
+    if st.session_state.get("auth_user"):
+        with st.sidebar:
+            st.markdown("### 👤 로그인 상태")
+            st.success(f"{st.session_state['auth_user']}님")
+            if st.button("로그아웃"):
+                st.session_state.pop("auth_user", None)
+                st.rerun()
+        return st.session_state["auth_user"]
+
+    st.markdown(
+        """
+        <div class="hero-banner">
+            <h1>🩺 OGQ 스티커 닥터</h1>
+            <p>로그인하면 내 진단 결과를 사용자별로 저장하고 재검사 기록을 확인할 수 있어요.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    tab_login, tab_signup = st.tabs(["로그인", "회원가입"])
+    with tab_login:
+        with st.form("login_form"):
+            username = st.text_input("아이디", key="login_username")
+            password = st.text_input("비밀번호", type="password", key="login_password")
+            submitted = st.form_submit_button("로그인", type="primary")
+        if submitted:
+            if verify_user(username, password):
+                st.session_state["auth_user"] = username.strip()
+                st.rerun()
+            else:
+                st.error("아이디 또는 비밀번호가 올바르지 않습니다.")
+
+    with tab_signup:
+        with st.form("signup_form"):
+            username = st.text_input("새 아이디", key="signup_username")
+            password = st.text_input("새 비밀번호", type="password", key="signup_password")
+            password_confirm = st.text_input("비밀번호 확인", type="password", key="signup_password_confirm")
+            submitted = st.form_submit_button("회원가입")
+        if submitted:
+            if password != password_confirm:
+                st.error("비밀번호 확인이 일치하지 않습니다.")
+            else:
+                ok, message = create_user(username, password)
+                if ok:
+                    st.success(message + " 이제 로그인해 주세요.")
+                else:
+                    st.error(message)
+
+    st.caption("현재 버전은 계정/기록 기능의 MVP입니다. 실제 서비스 배포 전에는 외부 인증/영구 DB로 이전하는 것을 권장합니다.")
+    return None
+
+
+current_user = _render_auth_gate()
+if not current_user:
+    st.stop()
+
 st.markdown(
     """
     <div class="hero-banner">
@@ -108,6 +166,8 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+st.caption(f"현재 로그인: {current_user}")
 
 
 def _draw_annotations(file_bytes: bytes, findings: list[dict]) -> Image.Image:
@@ -191,7 +251,7 @@ def _speak_completion(message: str = "") -> None:
 
               const gain = ctx.createGain();
               gain.gain.setValueAtTime(0.0001, now);
-              gain.gain.exponentialRampToValueAtTime(0.22, now + 0.015);
+              gain.gain.exponentialRampToValueAtTime(0.42, now + 0.015);
               gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.42);
               gain.connect(ctx.destination);
 
@@ -538,6 +598,13 @@ if files:
         help="체크하면 시장 비교와 시장 분석이 끝난 직후 선택한 검사 기준으로 AI 진단을 자동 실행합니다.",
     )
 
+    public_web_enabled = st.checkbox(
+        "Google 공개 웹 유사성 참고 조사도 실행",
+        value=False,
+        key="public_web_enabled",
+        help="OGQ 시장 분석과 별도로 공개 웹을 참고합니다. 추가 Gemini 요청이 발생하므로 필요할 때만 켜는 것을 권장합니다.",
+    )
+
     if st.button("🔎 OGQ 시장과 비교하기", type="primary"):
         # 이전 결과를 먼저 비워서 검색 실패 시 오래된 결과가 보이지 않도록 한다.
         st.session_state.pop("market_results", None)
@@ -607,18 +674,23 @@ if files:
                             if analysis:
                                 st.session_state["market_analysis"] = analysis
 
-                                # OGQ 데이터와 별개로, 공개 웹에서 대중적 유사성도 보조 조사한다.
-                                web_check = generate_public_web_check(
-                                    gemini_key,
-                                    feelings,
-                                    user_tags,
-                                )
-                                if web_check.get("text"):
-                                    st.session_state["public_web_check"] = web_check
-                                elif web_check.get("error"):
-                                    st.session_state["public_web_check_error"] = web_check["error"]
+                                # 공개 웹 조사는 선택 사항으로 분리한다.
+                                # 시장 비교 자체가 추가 Gemini 검색 호출 때문에 막히지 않도록 한다.
+                                if public_web_enabled:
+                                    web_check = generate_public_web_check(
+                                        gemini_key,
+                                        feelings,
+                                        user_tags,
+                                    )
+                                    if web_check.get("text"):
+                                        st.session_state["public_web_check"] = web_check
+                                    elif web_check.get("error"):
+                                        st.session_state["public_web_check_error"] = web_check["error"]
+                                else:
+                                    st.session_state["public_web_check"] = {}
+                                    st.session_state["public_web_check_error"] = "공개 웹 유사성 참고 조사는 선택하지 않아 실행하지 않았습니다. OGQ 시장 비교 분석에는 영향을 주지 않습니다."
 
-                                # 이미지 진단에는 실제 시장 분석 + 공개 웹 보조 조사 결과를 전달한다.
+                                # 이미지 진단에는 실제 시장 분석 + (실행했다면) 공개 웹 보조 조사 결과를 전달한다.
                                 st.session_state["market_context"] = build_market_context_for_diagnosis(
                                     analysis,
                                     market_results[:8],
@@ -803,7 +875,7 @@ if files:
     diagnosis_texts: dict[str, str] = {}
     for file_result in all_file_results:
         digest = hashlib.sha256(file_result["bytes"]).hexdigest()[:16]
-        cache_prefix = f"diag_v4_{file_result['name']}_{digest}_"
+        cache_prefix = f"diag_v5_{file_result['name']}_{digest}_"
         matched_keys = [
             key
             for key in st.session_state.keys()
@@ -962,25 +1034,53 @@ if files:
                 for grade, _, _ in fr["results"]
                 if grade == "fail"
             )
-            save_history_entry(
-                score,
-                pass_count,
-                warn_count,
-                fail_count,
-                checklist_done,
-                checklist_total,
-            )
-            st.success("히스토리에 저장했어요.")
+            diagnosis_payload = {}
+            for file_result in all_file_results:
+                digest = hashlib.sha256(file_result["bytes"]).hexdigest()[:16]
+                cache_prefix = f"diag_v5_{file_result['name']}_{digest}_"
+                matched_keys = [
+                    key for key in st.session_state.keys()
+                    if isinstance(key, str) and key.startswith(cache_prefix)
+                ]
+                if matched_keys:
+                    diagnosis_payload[file_result["name"]] = st.session_state[matched_keys[-1]]
 
-    history = load_history()
+            record_id = save_diagnosis_record(
+                current_user,
+                score=score,
+                pass_count=pass_count,
+                warn_count=warn_count,
+                fail_count=fail_count,
+                checklist_done=checklist_done,
+                checklist_total=checklist_total,
+                file_count=len(all_file_results),
+                market_keywords=_keywords_from_user_input(feelings, user_tags, limit=5),
+                diagnosis_payload={
+                    "market_analysis": st.session_state.get("market_analysis", {}),
+                    "files": diagnosis_payload,
+                },
+            )
+            if record_id:
+                st.success("내 계정의 진단 히스토리에 저장했어요.")
+            else:
+                st.error("사용자 기록 저장에 실패했습니다.")
+
+    history = load_user_diagnosis_history(current_user)
     if len(history) >= 2:
-        st.subheader("재검사 히스토리")
+        st.subheader(f"{current_user}님의 재검사 히스토리")
         st.line_chart({"score": [h["score"] for h in history]})
         st.caption(
             f"최근 {len(history)}회 검사 · 마지막: {history[-1]['timestamp']} ({history[-1]['score']}점)"
         )
+        with st.expander("저장된 최근 진단 확인"):
+            latest = history[-1]
+            st.write(f"파일 {latest['file_count']}개 · 체크리스트 {latest['checklist']}")
+            if latest.get("market_keywords"):
+                st.write("시장 검색어: " + ", ".join(latest["market_keywords"]))
     elif len(history) == 1:
-        st.caption("아직 히스토리가 1개예요. 수정 후 다시 저장하면 변화 그래프가 나타납니다.")
+        st.caption("내 히스토리가 1개예요. 수정 후 다시 저장하면 변화 그래프가 나타납니다.")
+    else:
+        st.caption("아직 저장된 진단 히스토리가 없습니다.")
 
     # ---------- 제출 구성 요약 ----------
     st.divider()
