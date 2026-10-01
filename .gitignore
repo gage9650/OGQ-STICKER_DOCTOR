@@ -11,3 +11,5 @@ __pycache__/
 
 # macOS가 자동 생성하는 파일
 .DS_Store
+
+sticker_doctor_users.db

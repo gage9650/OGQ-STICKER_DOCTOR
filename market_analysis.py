@@ -312,7 +312,7 @@ def generate_public_web_check(
     user_feelings: str,
     user_tags: list[str],
     *,
-    max_output_tokens: int = 900,
+    max_output_tokens: int = 600,
 ) -> dict[str, Any]:
     """Google Search grounding으로 공개 웹의 대중적 유사성만 보조 조사한다."""
     from google import genai
@@ -323,7 +323,7 @@ def generate_public_web_check(
 
     client = genai.Client(api_key=gemini_key)
     prompt = build_public_web_check_prompt(user_feelings, user_tags)
-    models = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
+    models = ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.8-flash"]
     grounding_tool = types.Tool(google_search=types.GoogleSearch())
     last_error: Exception | None = None
 
@@ -348,6 +348,24 @@ def generate_public_web_check(
                 last_error = exc
                 code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
                 message = str(exc)
+                # 'You exceeded your current quota'는 재시도로 해결되지 않을 수 있으므로
+                # 같은 요청을 반복하지 않고 즉시 사용자에게 명확히 알린다.
+                quota_exhausted = (
+                    code == 429
+                    and (
+                        "quota" in message.lower()
+                        or "resource_exhausted" in message.lower()
+                        or "exceeded your current quota" in message.lower()
+                    )
+                )
+                if quota_exhausted:
+                    return {
+                        "text": "",
+                        "sources": [],
+                        "error": "공개 웹 유사성 참고 조사를 실행하려면 Gemini API 할당량이 필요합니다. 현재 할당량을 초과해 이번 조사는 건너뛰었습니다. OGQ 시장 비교 분석은 정상적으로 유지됩니다.",
+                        "error_code": 429,
+                    }
+
                 transient = code in {408, 429, 500, 502, 503, 504} or any(str(c) in message for c in {408,429,500,502,503,504})
                 if transient and attempt < 1:
                     time.sleep(min(5.0, 1.2 * (2 ** attempt)) + random.uniform(0, 0.3))
